@@ -5,34 +5,33 @@ import re
 import sys
 import os
 import json
+from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
 
 # Path to the JSON file that will store shipping costs
 shipping_file = 'shipping_costs.json'
 
 # Function to print colored text with Rose Pine colors
 def print_colored(text, color_code):
-    # Rose Pine color codes
     COLORS = {
-        "red": "\033[38;5;209m",       # #eb6f92
-        "green": "\033[38;5;32m",      # #31748f
-        "yellow": "\033[38;5;229m",    # #f6c177
-        "blue": "\033[38;5;153m",      # #9ccfd8
-        "reset": "\033[38;5;255m"      # #e0def4
+        "red": "\033[38;5;209m",
+        "green": "\033[38;5;32m",
+        "yellow": "\033[38;5;229m",
+        "blue": "\033[38;5;153m",
+        "reset": "\033[38;5;255m"
     }
     print(f"{COLORS.get(color_code, COLORS['reset'])}{text}{COLORS['reset']}")
 
-# Step 1: Load Existing Shipping Costs (if they exist)
+# --- Step 1: Load Existing Shipping Costs (if they exist) ---
 if os.path.exists(shipping_file):
     with open(shipping_file, 'r') as file:
         shipping_costs = json.load(file)
 else:
     shipping_costs = {}
 
-# Function to get shipping cost for a seller (asks the user and stores it)
+# Function to get shipping cost for a seller
 def get_shipping_cost_for_seller(seller):
     if seller in shipping_costs:
         return shipping_costs[seller]
-    
     print_colored(f"Enter the shipping cost for seller '{seller}' (in AUD): ", "blue")
     while True:
         try:
@@ -42,14 +41,24 @@ def get_shipping_cost_for_seller(seller):
         except ValueError:
             print("Invalid input! Please enter a valid numeric shipping cost.")
 
-# --- Step 2: Get Card List from User ---
-print_colored("Enter your card list (one per line). When done, enter an empty line:", "blue")
+# --- Step 2: Get Card List with Quantities from User ---
+print_colored("Enter your card list with quantities (e.g. '2 Lightning Bolt'), one per line. When done, enter an empty line:", "blue")
+card_quantity_map = {}
 card_list = []
+
+pattern = re.compile(r'^(\d+)\s+(.+)$')
 while True:
     line = input()
     if line.strip() == "":
         break
-    card_list.append(line.strip())
+    match = pattern.match(line.strip())
+    if match:
+        qty = int(match.group(1))
+        name = match.group(2).strip()
+        card_quantity_map[name] = qty
+        card_list.append(name)
+    else:
+        print_colored(f"Skipping malformed line: {line}", "yellow")
 
 if not card_list:
     print_colored("No cards entered. Exiting.", "red")
@@ -83,8 +92,7 @@ listings = []
 for row in rows[1:]:
     cols = row.find_all("td")
     if len(cols) < 9:
-        continue  # skip if not a valid card row
-
+        continue
     try:
         card_name = cols[0].text.strip()
         seller = cols[1].text.strip()
@@ -104,7 +112,7 @@ for row in rows[1:]:
             'quantity': quantity,
             'price': price
         })
-    except Exception as e:
+    except Exception:
         continue
 
 df_listings = pd.DataFrame(listings)
@@ -124,49 +132,76 @@ else:
     print_colored("\nAll requested cards were found.", "green")
 
 # --- Step 6: Bulk Optimization Algorithm ---
+cards = df_listings['card_name'].unique()
+sellers = df_listings['seller'].unique()
+
+listing_map = {}
+buy_listing_vars = []
+prob = LpProblem("CardCartOptimization", LpMinimize)
+
+for i, row in df_listings.iterrows():
+    var = LpVariable(f"buy_{i}", 0, 1, LpBinary)
+    buy_listing_vars.append(var)
+    listing_map[i] = row
+
+use_seller_vars = {s: LpVariable(f"use_{s}", 0, 1, LpBinary) for s in sellers}
+
+prob += lpSum(
+    buy_listing_vars[i] * listing_map[i]['price']
+    for i in listing_map
+) + lpSum(
+    use_seller_vars[s] * get_shipping_cost_for_seller(s)
+    for s in sellers
+)
+
+for card in cards:
+    required_qty = card_quantity_map.get(card, 1)
+    indices = [i for i, row in listing_map.items() if row['card_name'] == card]
+    prob += lpSum(buy_listing_vars[i] * listing_map[i]['quantity'] for i in indices) >= required_qty
+
+for s in sellers:
+    indices = [i for i, row in listing_map.items() if row['seller'] == s]
+    for i in indices:
+        prob += buy_listing_vars[i] <= use_seller_vars[s]
+
+prob.solve(PULP_CBC_CMD(msg=0))
+
 cart = []
 sellers_used = set()
-
-for card in df_listings['card_name'].unique():
-    card_options = df_listings[df_listings['card_name'] == card]
-    
-    preferred_sellers = card_options[card_options['seller'].isin(sellers_used)]
-    
-    if not preferred_sellers.empty:
-        best_option = preferred_sellers.loc[preferred_sellers['price'].idxmin()]
-    else:
-        card_options = card_options.copy()
-        
-        # Add shipping costs to the total cost per card
-        card_options['shipping_cost'] = card_options['seller'].apply(get_shipping_cost_for_seller)
-        card_options['effective_total'] = card_options['price'] + card_options['shipping_cost']
-        
-        best_option = card_options.loc[card_options['effective_total'].idxmin()]
-        sellers_used.add(best_option['seller'])
-    
-    cart.append(best_option)
+for i, var in enumerate(buy_listing_vars):
+    if var.varValue == 1:
+        row = listing_map[i]
+        row_data = dict(row)
+        row_data['shipping_cost'] = get_shipping_cost_for_seller(row_data['seller'])
+        row_data['effective_total'] = row_data['price'] + row_data['shipping_cost']
+        cart.append(row_data)
+        sellers_used.add(row_data['seller'])
 
 df_cart = pd.DataFrame(cart)
 
-# --- Step 7: Summarize, Sort, and Save ---
+df_cart['total_cards_from_seller'] = df_cart.groupby('seller')['quantity'].transform('sum')
+df_cart = df_cart.sort_values(by=['total_cards_from_seller', 'seller', 'card_name'], ascending=[False, True, True])
+df_cart = df_cart.fillna({'shipping_cost': '-', 'effective_total': '-'})
+
+print_colored("\n--- Optimized Cart (Sorted by Seller and Quantity, NaN Replaced with Blank) ---", "blue")
+print(df_cart.to_string(index=False))
+
 total_card_price = df_cart['price'].sum()
-total_shipping = df_cart['shipping_cost'].sum()
+unique_sellers = df_cart['seller'].unique()
+total_shipping = sum(get_shipping_cost_for_seller(seller) for seller in unique_sellers)
 final_total = total_card_price + total_shipping
 
-# Sort by seller before saving
-df_cart = df_cart.sort_values(by=['seller', 'card_name'])
-
-# Display summary to terminal
-print_colored("\n--- Optimized Cart (Sorted by Seller) ---", "blue")
-print(df_cart)
 print_colored(f"\nTotal card price: ${total_card_price:.2f}", "green")
-print_colored(f"Shipping cost: ${total_shipping:.2f}", "green")
+print_colored(f"Shipping cost ({len(unique_sellers)} sellers): ${total_shipping:.2f}", "green")
 print_colored(f"Final total: ${final_total:.2f}", "green")
 
-# Save to CSV
-df_cart.to_csv('optimized_mtg_cart.csv', index=False)
-print_colored("\nCart saved to 'optimized_mtg_cart.csv' (sorted by seller)", "blue")
+seller_card_counts = df_cart.groupby('seller')['quantity'].sum()
+sellers_with_one_card = (seller_card_counts == 1).sum()
 
-# Step 8: Save the updated shipping costs back to the file
+print_colored(f"Number of sellers with only one card purchased: {sellers_with_one_card}", "yellow")
+
+df_cart.to_csv('optimized_mtg_cart_sorted.csv', index=False)
+print_colored("\nCart saved to 'optimized_mtg_cart_sorted.csv' (sorted by seller and quantity, NaN replaced with blank)", "blue")
+
 with open(shipping_file, 'w') as file:
     json.dump(shipping_costs, file)
