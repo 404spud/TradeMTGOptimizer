@@ -1,3 +1,6 @@
 *.csv
 test/
 *.json
+data/
+lists/
+outputs/
